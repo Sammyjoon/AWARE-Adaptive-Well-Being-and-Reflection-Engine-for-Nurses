@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AWARE Prototype</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <h1>AWARE</h1>
+      <p>Adaptive Well-Being and Reflection Engine for Nurses</p>
+    </header>
+
+    <main class="app-main">
+      <!-- Chat / history area -->
+      <section id="chat" class="chat-area">
+        <div class="system-bubble bubble">
+          <strong>AWARE</strong><br />
+          Hi, thanks for taking a moment to check in. When you’re ready, share how you’re
+          feeling and I’ll respond with an adaptive reflection prompt.
+        </div>
+      </section>
+
+      <!-- Right side: check-in form + history + patterns -->
+      <section class="form-area">
+        <form id="checkin-form">
+          <!-- Participant ID -->
+          <div class="field-group">
+            <label for="participant-id">
+              Participant ID
+            </label>
+            <input
+              type="text"
+              id="participant-id"
+              name="participant-id"
+              placeholder="e.g., P01, P02"
+            />
+            <small>
+              Use a code (not your real name). This helps us keep your check-ins together.
+            </small>
+          </div>
+
+          <!-- Stress slider -->
+          <div class="field-group">
+            <label for="stress">
+              How stressed do you feel right now?
+              <span id="stress-value">3</span> / 5
+            </label>
+            <input
+              type="range"
+              id="stress"
+              name="stress"
+              min="1"
+              max="5"
+              value="3"
+            />
+          </div>
+
+          <!-- Reflection depth -->
+          <div class="field-group">
+            <span>Reflection depth</span>
+            <div class="radio-row">
+              <label>
+                <input type="radio" name="mode" value="Quick" />
+                Quick
+              </label>
+              <label>
+                <input type="radio" name="mode" value="Normal" checked />
+                Normal
+              </label>
+              <label>
+                <input type="radio" name="mode" value="Deep" />
+                Deep
+              </label>
+            </div>
+            <small>
+              Quick = brief check-in • Normal = short prompt • Deep = more reflective questions
+            </small>
+          </div>
+
+          <!-- Text area -->
+          <div class="field-group">
+            <label for="text">
+              What’s on your mind from your shift or day?
+            </label>
+            <textarea
+              id="text"
+              name="text"
+              rows="3"
+              placeholder="You can write a sentence or two about what’s affecting you right now."
+            ></textarea>
+          </div>
+
+          <!-- Submit -->
+          <button type="submit" class="primary-btn">
+            Submit check-in
+          </button>
+
+          <p id="error-msg" class="error-msg" style="display:none;"></p>
+        </form>
+
+        <!-- History section -->
+        <div class="history-section">
+          <button type="button" id="history-btn" class="secondary-btn-block">
+            Show my recent check-ins
+          </button>
+          <div id="history-container" class="history-container"></div>
+        </div>
+
+        <!-- Pattern summary section -->
+        <div class="pattern-section">
+          <button type="button" id="pattern-btn" class="secondary-btn-block">
+            Summarize my recent patterns
+          </button>
+          <div id="pattern-container" class="pattern-container"></div>
+        </div>
+
+        <div class="note-section">
+          <small>
+            After using AWARE, you’ll be invited to complete a short survey about empathy,
+            clarity, and usefulness.
+          </small>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    // ===== Local storage helpers for Participant ID =====
+    function getStoredUserId() {
+      return localStorage.getItem("aware_user_id") || "";
+    }
+
+    function setStoredUserId(uid) {
+      localStorage.setItem("aware_user_id", uid);
+    }
+
+    const form = document.getElementById("checkin-form");
+    const chat = document.getElementById("chat");
+    const stressInput = document.getElementById("stress");
+    const stressValueEl = document.getElementById("stress-value");
+    const errorMsg = document.getElementById("error-msg");
+    const participantInput = document.getElementById("participant-id");
+    const historyBtn = document.getElementById("history-btn");
+    const historyContainer = document.getElementById("history-container");
+    const patternBtn = document.getElementById("pattern-btn");
+    const patternContainer = document.getElementById("pattern-container");
+
+    // Store last check-in so we can reuse it for deeper reflection
+    let lastCheckinContext = null;
+
+    // Pre-fill Participant ID from localStorage if available
+    participantInput.value = getStoredUserId();
+
+    // Update stress value label when slider moves
+    stressInput.addEventListener("input", () => {
+      stressValueEl.textContent = stressInput.value;
+    });
+
+    function appendUserMessage(text, stress, mode, participantId) {
+      const div = document.createElement("div");
+      div.className = "user-bubble bubble";
+      div.innerHTML = `<strong>You (${participantId})</strong><br />
+        <small>Stress: ${stress} • Mode: ${mode}</small><br />
+        ${text}`;
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function appendSystemMessage(reply, copingMode, usedMemory, modeForThisTurn) {
+      const div = document.createElement("div");
+      div.className = "system-bubble bubble";
+
+      let meta = `<small>Coping mode (detected): <strong>${copingMode}</strong>`;
+      if (usedMemory) {
+        meta += " • referring to recent check-ins";
+      }
+      meta += "</small><br />";
+
+      div.innerHTML = `<strong>AWARE</strong><br />${meta}${reply}`;
+
+      // Mixed-initiative: only after Quick check-ins
+      if (modeForThisTurn === "Quick") {
+        const followupDiv = document.createElement("div");
+        followupDiv.className = "followup-row";
+        followupDiv.innerHTML = `
+          <span>Would you like to go a bit deeper today?</span>
+          <button type="button" class="secondary-btn yes-deeper">Yes</button>
+          <button type="button" class="secondary-btn no-deeper">No</button>
+        `;
+        div.appendChild(followupDiv);
+
+        const yesBtn = followupDiv.querySelector(".yes-deeper");
+        const noBtn = followupDiv.querySelector(".no-deeper");
+
+        const disableButtons = () => {
+          yesBtn.disabled = true;
+          noBtn.disabled = true;
+        };
+
+        yesBtn.addEventListener("click", async () => {
+          disableButtons();
+          if (!lastCheckinContext) {
+            return;
+          }
+          const { participantId, stress, text } = lastCheckinContext;
+
+          try {
+            const response = await fetch("/api/checkin", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                user_id: participantId,
+                stress: stress,
+                mode: "Deep",   // deeper follow-up
+                text: text,
+              }),
+            });
+
+            if (!response.ok) {
+              const err = await response.json().catch(() => ({}));
+              const msg = err.detail || "Something went wrong. Please try again.";
+              errorMsg.textContent = msg;
+              errorMsg.style.display = "block";
+              return;
+            }
+
+            const data = await response.json();
+            appendSystemMessage(data.reply, data.coping_mode, data.used_memory, "Deep");
+          } catch (err) {
+            console.error(err);
+            errorMsg.textContent = "Network error during deeper reflection.";
+            errorMsg.style.display = "block";
+          }
+        });
+
+        noBtn.addEventListener("click", () => {
+          disableButtons();
+          const ackDiv = document.createElement("div");
+          ackDiv.className = "system-bubble bubble";
+          ackDiv.innerHTML = `<strong>AWARE</strong><br />
+            <small>Okay — we can keep things light today. Thanks for checking in.</small>`;
+          chat.appendChild(ackDiv);
+          chat.scrollTop = chat.scrollHeight;
+        });
+      }
+
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    async function loadHistoryForParticipant(participantId) {
+      historyContainer.innerHTML = "";
+      if (!participantId) {
+        historyContainer.innerHTML = "<small>Please enter a Participant ID above first.</small>";
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/history/${encodeURIComponent(participantId)}`);
+        if (!response.ok) {
+          historyContainer.innerHTML = "<small>Could not load history.</small>";
+          return;
+        }
+        const data = await response.json();
+        if (!data.length) {
+          historyContainer.innerHTML = "<small>No recent check-ins yet for this ID.</small>";
+          return;
+        }
+
+        const list = document.createElement("div");
+        data.forEach((item) => {
+          const entry = document.createElement("div");
+          entry.className = "history-entry";
+          entry.innerHTML = `
+            <div class="history-meta">
+              <span>${item.timestamp}</span>
+              <span>Stress: ${item.stress}</span>
+              <span>Mode: ${item.mode}</span>
+            </div>
+            <div class="history-body">
+              <strong>You:</strong> ${item.text}<br />
+              <strong>AWARE (${item.coping_mode}${item.used_memory ? ", using memory" : ""}):</strong>
+              <div class="history-reply">${item.reply}</div>
+            </div>
+          `;
+          list.appendChild(entry);
+        });
+
+        historyContainer.appendChild(list);
+      } catch (err) {
+        console.error(err);
+        historyContainer.innerHTML = "<small>Network error while loading history.</small>";
+      }
+    }
+
+    async function loadPatternSummary(participantId) {
+      patternContainer.innerHTML = "";
+      if (!participantId) {
+        patternContainer.innerHTML = "<small>Please enter a Participant ID above first.</small>";
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/pattern_summary/${encodeURIComponent(participantId)}`);
+        if (!response.ok) {
+          patternContainer.innerHTML = "<small>Could not load pattern summary.</small>";
+          return;
+        }
+        const data = await response.json();
+        patternContainer.innerHTML = `<div class="pattern-text">${data.summary}</div>`;
+      } catch (err) {
+        console.error(err);
+        patternContainer.innerHTML = "<small>Network error while loading pattern summary.</small>";
+      }
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      errorMsg.style.display = "none";
+
+      const participantId = participantInput.value.trim();
+      const stress = parseInt(stressInput.value, 10);
+      const text = document.getElementById("text").value.trim();
+      const modeEl = document.querySelector('input[name="mode"]:checked');
+      const mode = modeEl ? modeEl.value : "Normal";
+
+      if (!participantId) {
+        errorMsg.textContent = "Please enter your Participant ID before checking in.";
+        errorMsg.style.display = "block";
+        return;
+      }
+
+      if (!text) {
+        errorMsg.textContent = "Please write a few words about how you’re doing.";
+        errorMsg.style.display = "block";
+        return;
+      }
+
+      // Save participant ID locally so they don't have to re-type it
+      setStoredUserId(participantId);
+
+      // Store context for potential deeper reflection
+      lastCheckinContext = { participantId, stress, text };
+
+      // Show user message immediately
+      appendUserMessage(text, stress, mode, participantId);
+      document.getElementById("text").value = "";
+
+      try {
+        const response = await fetch("/api/checkin", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            user_id: participantId,
+            stress: stress,
+            mode: mode,
+            text: text,
+          }),
+        });
+
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          const msg = err.detail || "Something went wrong. Please try again.";
+          errorMsg.textContent = msg;
+          errorMsg.style.display = "block";
+          return;
+        }
+
+        const data = await response.json();
+        appendSystemMessage(data.reply, data.coping_mode, data.used_memory, mode);
+
+        // Refresh history after each check-in
+        loadHistoryForParticipant(participantId);
+      } catch (err) {
+        console.error(err);
+        errorMsg.textContent = "Network error. Please check that the server is running.";
+        errorMsg.style.display = "block";
+      }
+    });
+
+    historyBtn.addEventListener("click", () => {
+      const participantId = participantInput.value.trim();
+      loadHistoryForParticipant(participantId);
+    });
+
+    patternBtn.addEventListener("click", () => {
+      const participantId = participantInput.value.trim();
+      loadPatternSummary(participantId);
+    });
+  </script>
+</body>
+</html>

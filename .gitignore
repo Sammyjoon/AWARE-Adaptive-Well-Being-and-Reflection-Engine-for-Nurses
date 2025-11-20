@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual envs
+venv/
+.myenv/
+env/
+.venv/
+my_v_env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local data
+aware_logs.csv

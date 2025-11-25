@@ -1,6 +1,7 @@
 import os
-import csv
 import random
+import json
+import secrets
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List
@@ -9,6 +10,8 @@ from fastapi import FastAPI, Request, Form, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.exceptions import RequestValidationError
+from fastapi import HTTPException
 
 from pydantic import BaseModel, Field, validator
 
@@ -29,41 +32,73 @@ else:
     print("GEMINI_API_KEY not set in environment; Gemini disabled.")
 
 
-
 # ================== CONFIG ==================
 
 app = FastAPI()
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Return simpler, user-friendly messages for validation errors.
+    """
+    errors = []
+    for err in exc.errors():
+        loc = err.get("loc", [])
+        # loc example: ("body", "stress")
+        field = None
+        if len(loc) >= 2 and loc[0] == "body":
+            field = loc[1]
+        elif loc:
+            field = loc[-1]
+
+        msg = err.get("msg", "Invalid value.")
+        if field in ("user_id", "stress", "mode", "text"):
+            # Friendlier field names
+            pretty = {
+                "user_id": "Participant ID",
+                "stress": "Stress",
+                "mode": "Reflection mode",
+                "text": "Reflection text",
+            }.get(field, str(field))
+            errors.append(f"{pretty}: {msg}")
+        else:
+            errors.append(msg)
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Validation error",
+            "errors": errors or ["Invalid input."],
+        },
+    )
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    # Log to console for debugging
+    print("Unexpected server error:", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Sorry, something went wrong on the server."},
+    )
+
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
-LOG_FILE = BASE_DIR / "aware_logs.csv"
+DATA_DIR = BASE_DIR / "data"  # root for JSON logs
 
 # Mount static folder (for CSS/JS)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-# Initialize log file with header if not existing
-if not LOG_FILE.exists():
-    with LOG_FILE.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "timestamp",
-            "user_id",
-            "stress",
-            "mode",
-            "coping_mode",
-            "text",
-            "reply",
-            "used_memory",
-            "reply_length"
-        ])
+DATA_DIR.mkdir(exist_ok=True)
+
 
 # ================== IN-MEMORY STATE ==================
 
 # Simple in-memory history per user_id (for relational memory during current run)
 user_history: Dict[str, List[dict]] = {}
+# Map (nurse_login, participant_id) -> session_id for this server run
+session_tokens: Dict[tuple[str, str], str] = {}
 
 
 # ================== Pydantic MODELS ==================
@@ -76,23 +111,21 @@ class CheckinRequest(BaseModel):
 
     @validator("stress")
     def stress_in_range(cls, v):
-        if v < 1:
-            return 1
-        if v > 5:
-            return 5
+        if not 1 <= v <= 5:
+            raise ValueError("Stress must be between 1 and 5.")
         return v
 
     @validator("mode")
     def normalize_mode(cls, v):
         allowed = {"Quick", "Normal", "Deep"}
         if v not in allowed:
-            return "Normal"
+            raise ValueError("Mode must be one of: Quick, Normal, or Deep.")
         return v
 
     @validator("text")
     def non_empty_text(cls, v):
         if not v.strip():
-            raise ValueError("Text cannot be empty.")
+            raise ValueError("Please write a few words about how you’re doing.")
         return v.strip()
 
 
@@ -114,6 +147,68 @@ class HistoryItem(BaseModel):
 
 class PatternSummaryResponse(BaseModel):
     summary: str
+
+
+# ================== JSON STORAGE HELPERS ==================
+
+def _safe_user_id(user_id: str) -> str:
+    """Normalize user_id for filesystem paths."""
+    s = (user_id or "").strip()
+    safe = "".join(c for c in s if c.isalnum() or c in ("-", "_")).lower()
+    return safe or "anonymous"
+
+
+def get_user_dir(user_id: str) -> Path:
+    """Return the folder for this participant's JSON logs."""
+    safe = _safe_user_id(user_id)
+    d = DATA_DIR / safe
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_user_log_path(user_id: str) -> Path:
+    """Single JSON file per participant containing a list of check-ins."""
+    return get_user_dir(user_id) / "checkins.json"
+
+
+def load_user_rows_from_json(user_id: str) -> List[dict]:
+    """
+    Load all check-ins for a participant from JSON.
+    Returns [] if none exist yet.
+    """
+    path = get_user_log_path(user_id)
+    if not path.exists():
+        print(f"No JSON log yet for user '{user_id}'")
+        return []
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                print(f"Loaded {len(data)} check-ins from JSON for user '{user_id}'")
+                return data
+            else:
+                print(f"JSON log for '{user_id}' was not a list; resetting.")
+                return []
+    except Exception as e:
+        print(f"Error reading JSON log for user '{user_id}':", e)
+        return []
+
+
+def append_checkin_to_json(user_id: str, entry: dict) -> None:
+    """
+    Append a single check-in entry to the participant's JSON log.
+    Structure: a list of dicts, one per check-in.
+    """
+    path = get_user_log_path(user_id)
+    rows = load_user_rows_from_json(user_id)
+    rows.append(entry)
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        print(f"Appended check-in to JSON for user '{user_id}' (total now {len(rows)}).")
+    except Exception as e:
+        print(f"Error writing JSON log for user '{user_id}':", e)
 
 
 # ================== CORE LOGIC (RULE-BASED) ==================
@@ -161,8 +256,9 @@ def generate_feedback(stress: int,
     """
 
     used_memory = False
-    lines = []
-        # Special intent: user explicitly asks for encouragement
+    lines: List[str] = []
+
+    # Special intent: user explicitly asks for encouragement
     lower_text = text.lower()
     if "encourag" in lower_text or "motivat" in lower_text or "cheer me up" in lower_text:
         lines.append(
@@ -184,6 +280,7 @@ def generate_feedback(stress: int,
             )
         reply = " ".join(lines)
         return reply, used_memory
+
     # Opening: acknowledge stress level (adaptive tone)
     if stress <= 2:
         openings = [
@@ -269,51 +366,7 @@ def generate_feedback(stress: int,
     return reply, used_memory
 
 
-def log_interaction(user_id: str,
-                    stress: int,
-                    mode: str,
-                    coping_mode: str,
-                    text: str,
-                    reply: str,
-                    used_memory: bool):
-    """Append a row to the CSV log (for evaluation + analysis)."""
-    row = [
-        datetime.now().isoformat(),
-        user_id.strip(),         
-        stress,
-        mode,
-        coping_mode,
-        text,
-        reply,
-        int(used_memory),
-        len(reply),
-    ]
-
-    with LOG_FILE.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(row)
-
-# ================== HISTORY & PATTERN HELPERS ==================
-
-def load_user_rows_from_csv(user_id: str) -> List[dict]:
-    """
-    Load all rows for a user_id from the CSV log.
-    Matching is case-insensitive and ignores extra spaces.
-    """
-    rows = []
-    target = (user_id or "").strip().lower()
-
-    if LOG_FILE.exists():
-        with LOG_FILE.open("r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rid = (row.get("user_id") or "").strip().lower()
-                if rid == target:
-                    rows.append(row)
-
-    print(f"Found {len(rows)} rows for user '{target}'")
-    return rows
-
+# ================== PATTERN & SUMMARY HELPERS ==================
 
 def basic_pattern_summary(rows: List[dict]) -> str:
     """Simple rule-based pattern summary if LLM not available."""
@@ -323,7 +376,6 @@ def basic_pattern_summary(rows: List[dict]) -> str:
     stresses = [int(r["stress"]) for r in rows]
     avg_stress = sum(stresses) / len(stresses)
 
-    # Most common coping mode
     from collections import Counter
     coping_counts = Counter(r["coping_mode"] for r in rows)
     common_coping, _ = coping_counts.most_common(1)[0]
@@ -391,7 +443,8 @@ def maybe_gemini_refine_reply(user_text: str,
     if gemini_model is None:
         print("Gemini not available (gemini_model is None). Using draft reply.")
         return draft_reply
-        # Build a tiny recent transcript for conversational flow
+
+    # Build a tiny recent transcript for conversational flow
     if last_entry is not None:
         last_user = last_entry.get("text", "")
         last_system = last_entry.get("reply", "")
@@ -403,6 +456,7 @@ def maybe_gemini_refine_reply(user_text: str,
         )
     else:
         conversation_context = f"USER (now): {user_text}\n"
+
     # 3) Use Gemini to lightly refine the draft reply
     try:
         print("Gemini: refining draft reply for input:", user_text)
@@ -452,19 +506,14 @@ Return only the final reply text.
         return draft_reply
 
 
-
 # ================== ROUTES ==================
 
-# @app.get("/", response_class=HTMLResponse)
-# async def index(request: Request):
-#     """
-#     Render main UI (AWARE check-in interface).
-#     """
-#     return templates.TemplateResponse("index.html", {"request": request})
 # Simple demo users (replace with real auth or backend)
 USERS = {
     os.environ.get("AWARE_DEMO_USER", "nurse"): os.environ.get("AWARE_DEMO_PASS", "password")
 }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     user = request.cookies.get("user_id")
@@ -472,56 +521,207 @@ async def index(request: Request):
         return RedirectResponse("/login")
     return templates.TemplateResponse("index.html", {"request": request, "user_id": user})
 
+
 # Login / logout routes
 @app.get("/login", response_class=HTMLResponse)
 async def login_get(request: Request):
     user = request.cookies.get("user_id")
     if user:
-        return RedirectResponse("/")  
+        return RedirectResponse("/")
     return templates.TemplateResponse("login.html", {"request": request})
 
-# about page
-@app.get("/about", response_class=HTMLResponse)
-async def about(request: Request):
-    user = request.cookies.get("user_id")
-    return templates.TemplateResponse("about.html", {"request": request, "user_id": user})
-
-# flow page
-@app.get("/flow", response_class=HTMLResponse)
-async def flow(request: Request):
-    user = request.cookies.get("user_id")
-    return templates.TemplateResponse("workflow.html", {"request": request, "user_id": user})
-
-
-@app.get("/base", response_class=HTMLResponse)
-async def flow(request: Request):
-    user = request.cookies.get("user_id")
-    return templates.TemplateResponse("base.html", {"request": request, "user_id": user})
 
 @app.post("/login")
 async def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
     expected = USERS.get(username)
     if expected and expected == password:
         resp = RedirectResponse("/", status_code=status.HTTP_302_FOUND)
+        # app-level user account (e.g., 'nurse')
         resp.set_cookie(key="user_id", value=username, httponly=True)
+        # session_id groups all check-ins in this browser login session
+        session_id = secrets.token_hex(16)
+        resp.set_cookie(key="session_id", value=session_id, httponly=True)
         return resp
+
     return templates.TemplateResponse(
         "login.html",
         {"request": request, "error": "Invalid username or password."},
         status_code=401
     )
 
+
 @app.get("/logout")
 async def logout():
     resp = RedirectResponse("/login", status_code=status.HTTP_302_FOUND)
     resp.delete_cookie("user_id")
+    resp.delete_cookie("session_id")
     return resp
+
+
+# About page
+@app.get("/about", response_class=HTMLResponse)
+async def about(request: Request):
+    user = request.cookies.get("user_id")
+    return templates.TemplateResponse("about.html", {"request": request, "user_id": user})
+
+
+# Flow / workflow page
+@app.get("/flow", response_class=HTMLResponse)
+async def flow(request: Request):
+    user = request.cookies.get("user_id")
+    return templates.TemplateResponse("workflow.html", {"request": request, "user_id": user})
+
+def llm_generate_reply_for_checkin(
+    user_text: str,
+    stress: int,
+    mode: str,
+    coping_mode: str,
+    history_summary: str,
+    last_entry: Optional[dict],
+) -> str:
+    """
+    Gemini is now the PRIMARY conversation engine.
+
+    It should:
+    - Give empathetic, concise reflection replies.
+    - If the message is extremely short / vague (e.g., "ff", "ok", "idk"),
+      respond with a gentle clarification asking the user to share more detail.
+    - Never give diagnoses or clinical advice.
+    """
+
+    # Fallback if LLM is not available: use old rule-based behavior
+    if gemini_model is None:
+        draft_reply, _ = generate_feedback(
+            stress=stress,
+            mode=mode,
+            coping_mode=coping_mode,
+            text=user_text,
+            last_entry=last_entry,
+        )
+        return draft_reply
+
+    # Build brief conversation context for continuity
+    if last_entry is not None:
+        last_user = last_entry.get("text", "")
+        last_system = last_entry.get("reply", "")
+        conversation_context = (
+            "Previous AWARE turn:\n"
+            f"USER: {last_user}\n"
+            f"AWARE: {last_system}\n\n"
+        )
+    else:
+        conversation_context = ""
+
+    try:
+        prompt = f"""
+You are AWARE, a lightweight well-being reflection tool for nurses.
+You are NOT a therapist and must NOT give medical or mental health advice,
+diagnoses, or crisis instructions. You only offer gentle reflection prompts
+and supportive observations.
+
+Context:
+- Stress level (1–5): {stress}
+- Reflection mode: {mode}  (Quick / Normal / Deep)
+- Detected coping style (for the clinician/researcher, not user-facing term): {coping_mode}
+
+Recent check-ins (summary, newest last):
+{history_summary}
+
+{conversation_context}User's current message:
+\"\"\"{user_text}\"\"\"
+
+Your task:
+
+1. If the user's message is extremely short or vague, such as:
+   - just a couple of letters ("ff", "aa"),
+   - brief fillers like "ok", "fine", "idk", "meh",
+   - "nothing", "n/a", "good", "bad" with no detail,
+   then do NOT try to interpret it deeply.
+   Instead, write a short, gentle clarification asking them to share
+   a bit more detail about what happened or how they are feeling.
+
+2. Otherwise, respond with an empathetic reflection that:
+   - Acknowledges their situation and feelings in plain language.
+   - Matches the general depth:
+       * Quick: 2–3 concise sentences.
+       * Normal: 3–4 sentences.
+       * Deep: 4–5 sentences, maybe with 1–2 gentle questions.
+   - Avoids clinical or diagnostic language.
+   - Does not promise outcomes, only invites reflection and small steps.
+
+3. You may gently connect to patterns from recent check-ins if it feels natural,
+   but do not overload the answer with history.
+
+Return ONLY the reply text, no labels or extra formatting.
+"""
+        resp = gemini_model.generate_content(prompt)
+        reply = (resp.text or "").strip()
+        if not reply:
+            # If Gemini returns nothing, fall back to rule-based
+            draft_reply, _ = generate_feedback(
+                stress=stress,
+                mode=mode,
+                coping_mode=coping_mode,
+                text=user_text,
+                last_entry=last_entry,
+            )
+            return draft_reply
+        return reply
+    except Exception as e:
+        print("Gemini error in llm_generate_reply_for_checkin:", e)
+        # Fallback to rule-based if LLM fails
+        draft_reply, _ = generate_feedback(
+            stress=stress,
+            mode=mode,
+            coping_mode=coping_mode,
+            text=user_text,
+            last_entry=last_entry,
+        )
+        return draft_reply
+# ================== HISTORY & PATTERN HELPERS ==================
+
+def load_user_rows_from_csv(user_id: str) -> list:
+    """
+    Compatibility helper so newer code still works.
+
+    Now we simply delegate to the JSON-based loader so that
+    LLM context includes persisted history, not just this run.
+    """
+    return load_user_rows_from_json(user_id)
+
+def log_interaction(
+    user_id: str,
+    stress: int,
+    mode: str,
+    coping_mode: str,
+    text: str,
+    reply: str,
+    used_memory: bool,
+) -> None:
+    """
+    Append one check-in to the participant's JSON log.
+
+    This is the JSON version of the old CSV logger.
+    """
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "user_id": user_id,
+        "stress": stress,
+        "mode": mode,
+        "coping_mode": coping_mode,
+        "text": text,
+        "reply": reply,
+        "used_memory": used_memory,
+    }
+    append_checkin_to_json(user_id, entry)
+
 
 @app.post("/api/checkin", response_model=CheckinResponse)
 async def checkin(payload: CheckinRequest):
     """
     Core mixed-initiative, adaptive check-in endpoint.
-    Combines rule-based logic + optional Gemini refinement.
+    NOW: the main reply is generated entirely by Gemini (LLM),
+    with rule-based code used only for coping-mode tagging and fallback.
     """
     try:
         user_id = payload.user_id
@@ -535,28 +735,25 @@ async def checkin(payload: CheckinRequest):
     history = user_history.get(user_id, [])
     last_entry = history[-1] if history else None
 
-    # Also load CSV rows so LLM can see brief history context
+    # Load CSV/JSON rows so LLM can see brief history context
     csv_rows = load_user_rows_from_csv(user_id)
     history_summary = summarize_history_for_llm(csv_rows)
 
-    # User modeling: coping mode (rule-based)
+    # User modeling: coping mode (still rule-based for tagging)
     coping_mode = classify_coping_mode(text)
 
-    # Adaptive feedback using stress, mode, coping style, and memory
-    draft_reply, used_memory = generate_feedback(stress, mode, coping_mode, text, last_entry)
+    # For logging: we consider "memory available" if there was a last entry
+    used_memory = last_entry is not None
 
-    # LLM refinement (optional, safe fallback)
-    final_reply = maybe_gemini_refine_reply(
+    # LLM is the primary conversation engine
+    final_reply = llm_generate_reply_for_checkin(
         user_text=text,
         stress=stress,
         mode=mode,
         coping_mode=coping_mode,
-        draft_reply=draft_reply,
         history_summary=history_summary,
         last_entry=last_entry,
     )
-
-
     # Update in-memory history
     entry = {
         "timestamp": datetime.now().isoformat(),
@@ -571,13 +768,13 @@ async def checkin(payload: CheckinRequest):
     history.append(entry)
     user_history[user_id] = history
 
-    # Log to CSV for evaluation
+    # Log to CSV/JSON for evaluation
     log_interaction(user_id, stress, mode, coping_mode, text, final_reply, used_memory)
 
     return CheckinResponse(
         reply=final_reply,
         coping_mode=coping_mode,
-        used_memory=used_memory
+        used_memory=used_memory,
     )
 
 
@@ -585,9 +782,9 @@ async def checkin(payload: CheckinRequest):
 async def get_history(user_id: str):
     """
     Return last few check-ins for a given participant.
-    Reads from the CSV log so history persists across restarts.
+    Reads from the per-user JSON log so history persists across restarts.
     """
-    rows = load_user_rows_from_csv(user_id)
+    rows = load_user_rows_from_json(user_id)
     recent = rows[-5:]
 
     print(f"Returning {len(recent)} history items for '{user_id}'")
@@ -600,7 +797,7 @@ async def get_history(user_id: str):
             coping_mode=row["coping_mode"],
             text=row["text"],
             reply=row["reply"],
-            used_memory=bool(int(row["used_memory"])),
+            used_memory=bool(row.get("used_memory", False)),
         )
         for row in recent
     ]
@@ -611,8 +808,9 @@ async def pattern_summary(user_id: str):
     """
     Use Gemini (if available) to summarize recent patterns in the user's check-ins.
     Falls back to a simple rule-based summary if Gemini is not available.
+    Data is read from the per-user JSON log.
     """
-    rows = load_user_rows_from_csv(user_id)
+    rows = load_user_rows_from_json(user_id)
     if not rows:
         return PatternSummaryResponse(summary="No check-ins yet for this participant.")
 

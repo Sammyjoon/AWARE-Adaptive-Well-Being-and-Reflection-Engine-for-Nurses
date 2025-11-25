@@ -21,6 +21,9 @@
     </div>
 
     <div class="right">
+      <button id="theme-toggle-btn" class="secondary-btn" type="button">
+      <span id="theme-toggle-icon">🌞</span>
+      </button>
       <div class="user">Signed in as <strong>{{ user_id }}</strong></div>
       <div class="logout"><a href="/logout">Logout</a></div>
     </div>
@@ -150,12 +153,91 @@
     const historyContainer = document.getElementById("history-container");
     const patternBtn = document.getElementById("pattern-btn");
     const patternContainer = document.getElementById("pattern-container");
+    async function handleErrorResponse(response, errorMsgElement) {
+  const err = await response.json().catch(() => ({}));
+  let msg = "Something went wrong. Please try again.";
+
+  if (response.status === 422) {
+    if (Array.isArray(err.errors) && err.errors.length) {
+      msg = err.errors.join(" ");
+    } else if (typeof err.detail === "string") {
+      msg = err.detail;
+    }
+  } else if (typeof err.detail === "string") {
+    msg = err.detail;
+  }
+
+  errorMsgElement.textContent = msg;
+  errorMsgElement.style.display = "block";
+}
+
+
+    // ===== Theme toggle (light / dark) =====
+    const themeToggleBtn = document.getElementById("theme-toggle-btn");
+    const themeToggleIcon = document.getElementById("theme-toggle-icon");
+    const THEME_KEY = "aware_theme";
+    
+    function applyTheme(theme) {
+      if (theme === "dark") {
+        document.body.classList.add("dark-theme");
+        if (themeToggleIcon) themeToggleIcon.textContent = "🌙";
+      } else {
+        document.body.classList.remove("dark-theme");
+        if (themeToggleIcon) themeToggleIcon.textContent = "🌞";
+      }
+      localStorage.setItem(THEME_KEY, theme);
+    }
+    function initTheme() {
+      const saved = localStorage.getItem(THEME_KEY);
+      const theme = saved === "dark" ? "dark" : "light";
+      applyTheme(theme);
+    }
+    if (themeToggleBtn) {
+      themeToggleBtn.addEventListener("click", () => {
+        const isDark = document.body.classList.contains("dark-theme");
+        applyTheme(isDark ? "light" : "dark");
+      });
+    }
+    initTheme();
+
 
     // Store last check-in so we can reuse it for deeper reflection
     let lastCheckinContext = null;
 
     // Pre-fill Participant ID from localStorage if available
     participantInput.value = getStoredUserId();
+    // Track which participant the chat currently represents
+    let currentParticipantId = participantInput.value.trim() || "";
+
+    // Reset chat bubbles when participant changes
+    function resetChatToWelcome() {
+      chat.innerHTML = `
+        <div class="system-bubble bubble">
+        <strong>AWARE</strong><br />
+        Hi, thanks for taking a moment to check in. When you’re ready, share how you’re
+        feeling and I’ll respond with an adaptive reflection prompt.
+        </div>
+        `;
+      errorMsg.style.display = "none";
+      lastCheckinContext = null;
+      }
+    participantInput.addEventListener("change", () => {
+      const newId = participantInput.value.trim();
+      // If nothing actually changed, do nothing
+      if (newId === currentParticipantId) {
+        return;
+      }
+      currentParticipantId = newId;
+      // Clear chat + side panels when switching participants
+      resetChatToWelcome();
+      historyContainer.innerHTML = "";
+      patternContainer.innerHTML = "";
+      if (!newId) {
+        historyContainer.innerHTML = "<small>Please enter a Participant ID above first.</small>";
+      }
+    });
+
+
 
     // Update stress value label when slider moves
     stressInput.addEventListener("input", () => {
@@ -225,10 +307,7 @@
             });
 
             if (!response.ok) {
-              const err = await response.json().catch(() => ({}));
-              const msg = err.detail || "Something went wrong. Please try again.";
-              errorMsg.textContent = msg;
-              errorMsg.style.display = "block";
+              await handleErrorResponse(response, errorMsg);
               return;
             }
 
@@ -349,6 +428,8 @@
 
       // Store context for potential deeper reflection
       lastCheckinContext = { participantId, stress, text };
+      currentParticipantId = participantId;
+
 
       // Show user message immediately
       appendUserMessage(text, stress, mode, participantId);
@@ -369,10 +450,7 @@
         });
 
         if (!response.ok) {
-          const err = await response.json().catch(() => ({}));
-          const msg = err.detail || "Something went wrong. Please try again.";
-          errorMsg.textContent = msg;
-          errorMsg.style.display = "block";
+          await handleErrorResponse(response, errorMsg);
           return;
         }
 

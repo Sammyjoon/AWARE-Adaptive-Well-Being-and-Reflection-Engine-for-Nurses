@@ -9,8 +9,8 @@
         body {
             margin: 0;
             font-family: system-ui, sans-serif;
-            background: #ffffff;
-            color: #111827;
+            background: var(--bg-color);
+            color: var(--text-color);
             display: flex;
             flex-direction: column;
             height: 100vh;
@@ -87,6 +87,9 @@
         </div>
 
         <div class="right">
+            <button id="theme-toggle-btn" class="secondary-btn" type="button">
+            <span id="theme-toggle-icon">🌞</span>
+            </button>
             <div class="user">Signed in as <strong>{{ user_id }}</strong></div>
             <div class="logout"><a href="/logout">Logout</a></div>
         </div>
@@ -226,6 +229,36 @@
             .text(d => d);
 
     </script>
+    <script>
+        const themeToggleBtn = document.getElementById("theme-toggle-btn");
+        const themeToggleIcon = document.getElementById("theme-toggle-icon");
+        const THEME_KEY = "aware_theme";
+
+        function applyTheme(theme) {
+            if (theme === "dark") {
+                document.body.classList.add("dark-theme");
+                if (themeToggleIcon) themeToggleIcon.textContent = "🌙";
+            } else {
+                document.body.classList.remove("dark-theme");
+                if (themeToggleIcon) themeToggleIcon.textContent = "🌞";
+            }
+            localStorage.setItem(THEME_KEY, theme);
+        }
+
+        function initTheme() {
+            const saved = localStorage.getItem(THEME_KEY);
+            const theme = saved === "dark" ? "dark" : "light";
+            applyTheme(theme);
+        }
+        if (themeToggleBtn) {
+            themeToggleBtn.addEventListener("click", () => {
+                const isDark = document.body.classList.contains("dark-theme");
+                applyTheme(isDark ? "light" : "dark");
+            });
+        }
+        initTheme();
+    </script>
+
 </body>
 
 </html>

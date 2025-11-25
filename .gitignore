@@ -1,18 +1,13 @@
+# macOS
+.DS_Store
+
 # Python
 __pycache__/
 *.pyc
 
-# Virtual envs
-venv/
-.myenv/
-env/
-.venv/
-my_v_env/
-
-# OS / editor
-.DS_Store
-.vscode/
-.idea/
-
-# Local data
+# AWARE app data logs
+data/
 aware_logs.csv
+
+# Env / secrets
+.env
